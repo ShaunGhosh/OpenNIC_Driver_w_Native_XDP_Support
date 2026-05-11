@@ -1,0 +1,10 @@
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+.Xil/
+vivado_pid*.str
+.cache.mk
