@@ -120,7 +120,6 @@ static const struct net_device_ops onic_netdev_ops = {
 	.ndo_open = onic_open_netdev,
 	.ndo_stop = onic_stop_netdev,
 	.ndo_start_xmit = onic_xmit_frame,
-	.ndo_bpf = onic_xdp,
 	.ndo_set_mac_address = onic_set_mac_address,
 	.ndo_do_ioctl = onic_do_ioctl,
 	.ndo_change_mtu = onic_change_mtu,

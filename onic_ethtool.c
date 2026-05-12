@@ -17,8 +17,6 @@
 #include <linux/pci.h>
 #include <linux/netdevice.h>
 #include <linux/ethtool.h>
-#include <linux/net_tstamp.h>
-#include <linux/socket.h>
 
 #include "onic.h"
 
@@ -37,26 +35,9 @@ static void onic_get_drvinfo(struct net_device *netdev,
 		sizeof(drvinfo->bus_info));
 }
 
-//Add function onic_get_ts_info function
-static int onic_get_ts_info(struct net_device *netdev,
-                            struct ethtool_ts_info *info)
-{
-    info->so_timestamping =
-        SOF_TIMESTAMPING_SOFTWARE |
-        SOF_TIMESTAMPING_RX_SOFTWARE |
-        SOF_TIMESTAMPING_TX_SOFTWARE;
-
-    info->phc_index = -1;   /* no PHC */
-    info->tx_types = 0;     /* no HW TX timestamp types */
-    info->rx_filters = 0;   /* no HW RX filters */
-    return 0;
-}
-
-
 static const struct ethtool_ops onic_ethtool_ops = {
 	.get_drvinfo = onic_get_drvinfo,
 	.get_link = ethtool_op_get_link,
-	.get_ts_info = onic_get_ts_info, /*Added here*/
 };
 
 void onic_set_ethtool_ops(struct net_device *netdev)
