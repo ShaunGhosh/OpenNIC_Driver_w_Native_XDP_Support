@@ -18,6 +18,10 @@
 #include <linux/pci.h>
 #include <linux/etherdevice.h>
 #include <linux/netdevice.h>
+#include <linux/skbuff.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
+#include <net/xdp.h>
 
 #include "onic_netdev.h"
 #include "qdma_access/qdma_register.h"
@@ -107,6 +111,78 @@ static void onic_rx_refill(struct onic_rx_queue *q)
 	onic_set_rx_head(priv->hw.qdma, q->qid, ring->next_to_use);
 }
 
+
+/*
+ * Minimal native-XDP attach support.
+ *
+ * This stores one XDP program per net_device. The RX path below runs the
+ * program before skb allocation. This is native XDP, not AF_XDP zero-copy.
+ * AF_XDP can still use XDP_REDIRECT in copy mode through XSKMAP.
+ */
+int onic_xdp(struct net_device *dev, struct netdev_bpf *xdp)
+{
+	struct onic_private *priv = netdev_priv(dev);
+	struct bpf_prog *old_prog;
+
+	switch (xdp->command) {
+	case XDP_SETUP_PROG:
+		old_prog = rcu_dereference_protected(priv->xdp_prog,
+							 rtnl_is_locked());
+		rcu_assign_pointer(priv->xdp_prog, xdp->prog);
+		if (old_prog) {
+			synchronize_rcu();
+			bpf_prog_put(old_prog);
+		}
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static __always_inline bool onic_run_xdp(struct onic_rx_queue *q,
+						 struct bpf_prog *prog,
+						 u8 *data, int len,
+						 bool *xdp_redirected)
+{
+	struct xdp_buff xdp;
+	u32 act;
+
+	/*
+	 * OpenNIC RX buffers are page-backed and the packet starts at buf->offset.
+	 * This minimal native-XDP implementation gives XDP exactly the received
+	 * packet region. Programs that only parse and redirect, such as the PTP
+	 * Sync interceptor, are fine. Programs that require head adjustment may
+	 * need reserved headroom in the RX buffer layout.
+	 */
+	xdp_init_buff(&xdp, PAGE_SIZE, &q->xdp_rxq);
+	xdp_prepare_buff(&xdp, data, 0, len, false);
+
+	act = bpf_prog_run_xdp(prog, &xdp);
+
+	switch (act) {
+	case XDP_PASS:
+		return false;
+
+	case XDP_DROP:
+		q->netdev->stats.rx_dropped++;
+		return true;
+
+	case XDP_REDIRECT:
+		if (xdp_do_redirect(q->netdev, &xdp, prog) == 0) {
+			*xdp_redirected = true;
+			return true;
+		}
+		q->netdev->stats.rx_dropped++;
+		return true;
+
+	case XDP_ABORTED:
+	default:
+		netdev_warn_once(q->netdev, "unexpected XDP action %u\n", act);
+		q->netdev->stats.rx_dropped++;
+		return true;
+	}
+}
+
 static int onic_rx_poll(struct napi_struct *napi, int budget)
 {
 	struct onic_rx_queue *q =
@@ -126,6 +202,7 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	bool flipped = 0;
 	bool debug = 0;
 	u8 arm_irq = 0;
+	bool xdp_redirected = false;
 
 	for (i = 0; i < priv->num_tx_queues; i++)
 		onic_tx_clean(priv->tx_queue[i]);
@@ -182,15 +259,28 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		struct onic_rx_buffer *buf =
 			&q->buffer[desc_ring->next_to_clean];
 		struct sk_buff *skb;
+		struct bpf_prog *xdp_prog;
 		int len = cmpl.pkt_len;
 		u8 *data;
+
+		/* maximum packet size is 1514, less than the page size */
+		data = (u8 *)(page_address(buf->pg) + buf->offset);
+
+		rcu_read_lock();
+		xdp_prog = rcu_dereference(priv->xdp_prog);
+		if (xdp_prog && onic_run_xdp(q, xdp_prog, data, len, &xdp_redirected)) {
+			rcu_read_unlock();
+			priv->netdev_stats.rx_packets++;
+			priv->netdev_stats.rx_bytes += len;
+			goto rx_consume;
+		}
+		rcu_read_unlock();
+
 		skb = napi_alloc_skb(napi, len);
 		if (!skb) {
 			rv = -ENOMEM;
 			break;
 		}
-		/* maximum packet size is 1514, less than the page size */
-		data = (u8 *)(page_address(buf->pg) + buf->offset);
 		skb_put_data(skb, data, len);
 		skb->protocol = eth_type_trans(skb, q->netdev);
 		skb->ip_summed = CHECKSUM_NONE;
@@ -203,6 +293,7 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 		priv->netdev_stats.rx_packets++;
 		priv->netdev_stats.rx_bytes += len;
 
+	rx_consume:
 		onic_ring_increment_tail(desc_ring);
 
 		if (debug)
@@ -303,6 +394,8 @@ static int onic_rx_poll(struct napi_struct *napi, int budget)
 	}
 
 out_of_budget:
+	if (xdp_redirected)
+		xdp_do_flush();
 	if (debug)
 		netdev_info(q->netdev, "rx_poll is done");
 	if (debug)
@@ -426,6 +519,11 @@ static void onic_clear_rx_queue(struct onic_private *priv, u16 qid)
 	napi_disable(&q->napi);
 	netif_napi_del(&q->napi);
 
+	if (q->xdp_rxq_registered) {
+		xdp_rxq_info_unreg(&q->xdp_rxq);
+		q->xdp_rxq_registered = false;
+	}
+
 	ring = &q->desc_ring;
 	real_count = ring->count - 1;
 	size = QDMA_C2H_ST_DESC_SIZE * real_count + QDMA_WB_STAT_SIZE;
@@ -480,6 +578,11 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 	q->netdev = dev;
 	q->vector = priv->q_vector[vid];
 	q->qid = qid;
+
+	rv = xdp_rxq_info_reg(&q->xdp_rxq, dev, qid, 0);
+	if (rv < 0)
+		goto free_rx_queue_direct;
+	q->xdp_rxq_registered = true;
 
 	/* allocate DMA memory for RX descriptor ring */
 	ring = &q->desc_ring;
@@ -585,6 +688,10 @@ static int onic_init_rx_queue(struct onic_private *priv, u16 qid)
 
 clear_rx_queue:
 	onic_clear_rx_queue(priv, qid);
+	return rv;
+
+free_rx_queue_direct:
+	kfree(q);
 	return rv;
 }
 
@@ -700,6 +807,8 @@ netdev_tx_t onic_xmit_frame(struct sk_buff *skb, struct net_device *dev)
 
 	if (rv < 0)
 		check_rv = 1;
+	/* adding software timestamping capability */
+	skb_tx_timestamp(skb);
 
 	dma_addr = dma_map_single(&priv->pdev->dev, skb->data, skb->len,
 				  DMA_TO_DEVICE);

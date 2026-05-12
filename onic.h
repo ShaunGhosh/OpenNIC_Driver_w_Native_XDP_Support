@@ -19,7 +19,8 @@
 
 #include <linux/netdevice.h>
 #include <linux/cpumask.h>
-
+#include <net/xdp.h>
+#include <linux/filter.h>
 #include "onic_hardware.h"
 
 #define ONIC_MAX_QUEUES			64
@@ -76,6 +77,8 @@ struct onic_rx_queue {
 	struct onic_ring desc_ring;
 	struct onic_ring cmpl_ring;
 	struct onic_q_vector *vector;
+	struct xdp_rxq_info xdp_rxq;
+	bool xdp_rxq_registered;
 
 	struct napi_struct napi;
 };
@@ -92,6 +95,7 @@ struct onic_q_vector {
  **/
 struct onic_private {
 	struct list_head dev_list;
+	struct bpf_prog __rcu *xdp_prog;
 
 	struct pci_dev *pdev;
 	DECLARE_BITMAP(state, 32);
